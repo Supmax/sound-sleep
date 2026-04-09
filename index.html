@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <meta name="theme-color" content="#0d1b38"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="睡眠"/>
+  <link rel="manifest" href="/manifest.json"/>
+  <link rel="apple-touch-icon" href="/icon-192.png"/>
+  <title>睡眠追踪器</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+    html,body,#root{min-height:100%;width:100%}
+    body{background:#060d1f;font-family:'Georgia','Times New Roman',serif;color:#e2e8f0;overscroll-behavior:none}
+    input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:rgba(99,179,237,0.25);outline:none}
+    input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:20px;height:20px;border-radius:50%;background:#3182ce;cursor:pointer;box-shadow:0 0 8px rgba(49,130,206,0.5)}
+    input[type=date],input[type=time]{color-scheme:dark}
+    ::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:rgba(99,179,237,0.2);border-radius:2px}
+    .fade-in{animation:fadeIn 0.3s ease} @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  </style>
+
+  <!-- CDN deps -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.4/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const { AreaChart, Area, LineChart, Line, BarChart, Bar, ComposedChart,
+        XAxis, YAxis, CartesianGrid, Tooltip: RTooltip, ResponsiveContainer,
+        Legend, PieChart, Pie, Cell } = Recharts;
+
+// ─── SW registration + notification scheduling ────────────────────────────
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () =>
+    navigator.serviceWorker.register("/sw.js").catch(console.error)
+  );
+}
+async function scheduleNotification(timeStr) {
+  if (!("Notification" in window)) return;
+  const perm = Notification.permission === "granted"
+    ? "granted"
+    : await Notification.requestPermission();
+  if (perm !== "granted") return;
+  const reg = await navigator.serviceWorker.ready;
+  const [h, m] = timeStr.split(":").map(Number);
+  const now = new Date(), target = new Date();
+  target.setHours(h, m, 0, 0);
+  if (target <= now) target.setDate(target.getDate() + 1);
+  reg.active?.postMessage({
+    type: "SCHEDULE_NOTIF",
+    delayMs: target - now,
+    title: "🌙 睡眠追踪器",
+    body: "记得记录今天的睡眠和屏幕时间",
+  });
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const fmtDate  = d => { const dt = new Date(d+"T00:00:00"); return `${dt.getMonth()+1}/${dt.getDate()}`; };
+const timeToH  = t => { if (!t) return null; const [h,m]=t.split(":").map(Number); return h+m/60; };
+const hToHM    = v => { if (v==null||isNaN(v)) return "--"; const h=Math.floor(Math.abs(v)),m=Math.round((Math.abs(v)-h)*60); return `${h}h ${String(m).padStart(2,"0")}m`; };
+const gap      = (a,b) => { if (a==null||b==null) return null; let d=b-a; if(d<0) d+=24; return d; };
+const disposable = r => {
+  const bed = r.inBedDuration ?? r.duration;
+  const scr = r.screenTotalMin != null ? r.screenTotalMin/60 : null;
+  return (bed!=null && scr!=null) ? Math.max(0,24-bed-scr) : null;
+};
+
+// ─── Shortcuts JSON parser ────────────────────────────────────────────────
+function parseJSON(text) {
+  const arr = [].concat(JSON.parse(text));
+  const out = {};
+  for (const d of arr) {
+    if (!d.date) continue;
+    const ibMin = d.inBedMin ?? d.in_bed_min ?? null;
+    const aMin  = d.totalAsleepMin ?? d.total_asleep_min ?? null;
+    out[d.date] = {
+      bedTime:   d.bedTime   || d.bed_time   || null,
+      sleepTime: d.sleepTime || d.sleep_time || null,
+      wakeTime:  d.wakeTime  || d.wake_time  || null,
+      coreMin:   d.coreMin   ?? d.core_min   ?? null,
+      deepMin:   d.deepMin   ?? d.deep_min   ?? null,
+      remMin:    d.remMin    ?? d.rem_min     ?? null,
+      awakeMin:  d.awakeMin  ?? d.awake_min  ?? null,
+      inBedMin:  ibMin != null ? Math.round(ibMin) : null,
+      efficiency:d.efficiency ?? (ibMin&&aMin ? Math.round(aMin/ibMin*100) : null),
+      screenTotalMin: d.screenTotalMinutes ?? d.screenMinutes ?? d.screen_minutes ?? null,
+      apps: (d.apps||[]).map(a=>({name:a.name||"未知",minutes:a.minutes||0,category:a.category||"其他"}))
+                        .sort((a,b)=>b.minutes-a.minutes),
+    };
+  }
+  return out;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────
+const STORAGE_KEY = "sleep-pwa-v1";
+const SETTINGS_KEY = "sleep-pwa-settings";
+const QE = {1:"😫",2:"😔",3:"😐",4:"😊",5:"✨"};
+const QL = {1:"很差",2:"较差",3:"一般",4:"良好",5:"极佳"};
+const APP_CLR = ["#63b3ed","#9f7aea","#f6ad55","#68d391","#fc8174","#4fd1c5","#f687b3","#b794f4","#ed8936","#48bb78"];
+const CAT_CLR = {"社交":"#63b3ed","娱乐":"#f6ad55","效率":"#68d391","健康":"#9f7aea","阅读":"#4fd1c5","游戏":"#fc8174","其他":"#718096"};
+const emptyForm = () => ({date:todayStr(),bedTime:"23:00",sleepTime:"23:30",wakeTime:"07:00",quality:4,coreMin:"",deepMin:"",remMin:"",awakeMin:"",efficiency:""});
+
+// ─── Tooltip ──────────────────────────────────────────────────────────────
+const CTip = ({active,payload,label}) => {
+  if(!active||!payload?.length) return null;
+  const unitOf = n => ["睡眠时长","在床时长","屏幕时间","可支配时间","深度睡眠","核心睡眠","快速眼动"].includes(n)?"h":n==="效率"?"%":n==="入睡延迟"?"m":"";
+  return (
+    <div style={{background:"rgba(5,12,30,0.97)",border:"1px solid rgba(99,179,237,0.2)",borderRadius:10,padding:"9px 14px",fontSize:12,minWidth:140}}>
+      <div style={{color:"#63b3ed",fontWeight:700,marginBottom:5}}>{label}</div>
+      {payload.map((p,i)=>(
+        <div key={i} style={{color:p.color,marginBottom:2}}>
+          {p.name}: <b>{typeof p.value==="number"?p.value.toFixed(1):p.value}{unitOf(p.name)}</b>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ─── Main ─────────────────────────────────────────────────────────────────
+function App() {
+  const [records,   setRecords]   = useState([]);
+  const [view,      setView]      = useState("log"); // log|chart|table
+  const [form,      setForm]      = useState(emptyForm());
+  const [editId,    setEditId]    = useState(null);
+  const [saved,     setSaved]     = useState(false);
+  const [settings,  setSettings]  = useState({reminderTime:"09:00",reminderOn:false});
+  const [showSet,   setShowSet]   = useState(false);
+  const [showImp,   setShowImp]   = useState(false);
+  const [showGuide, setShowGuide] = useState(false);
+  const [showSchema,setShowSchema]= useState(false);
+  const [impSt,     setImpSt]     = useState(null);
+  const [detailDate,setDetailDate]= useState(null);
+  const fileRef = useRef();
+
+  // Load
+  useEffect(()=>{
+    try{const r=localStorage.getItem(STORAGE_KEY);if(r)setRecords(JSON.parse(r));}catch{}
+    try{const s=localStorage.getItem(SETTINGS_KEY);if(s)setSettings(JSON.parse(s));}catch{}
+  },[]);
+
+  // Re-schedule notification on load
+  useEffect(()=>{
+    if(settings.reminderOn) scheduleNotification(settings.reminderTime);
+  },[]);
+
+  const persist = d => { setRecords(d); try{localStorage.setItem(STORAGE_KEY,JSON.stringify(d));}catch{} };
+  const saveSettings = s => { setSettings(s); try{localStorage.setItem(SETTINGS_KEY,JSON.stringify(s));}catch{} };
+
+  const upsert = rec => {
+    let u; if(editId){u=records.map(r=>r.id===editId?{...rec,id:editId}:r);setEditId(null);}
+    else{const i=records.findIndex(r=>r.date===rec.date);u=i>=0?records.map((r,j)=>j===i?rec:r):[...records,rec];}
+    persist(u.sort((a,b)=>a.date.localeCompare(b.date)));
+  };
+
+  const handleSave = () => {
+    const bD=timeToH(form.bedTime),sD=timeToH(form.sleepTime),wD=timeToH(form.wakeTime);
+    const ex=records.find(r=>r.date===form.date);
+    upsert({id:editId||Date.now(),date:form.date,bedTime:form.bedTime,sleepTime:form.sleepTime,wakeTime:form.wakeTime,
+      duration:gap(sD,wD),inBedDuration:gap(bD,wD),soa:gap(bD,sD),quality:form.quality,source:"manual",
+      coreMin:form.coreMin!==""?+form.coreMin:null,deepMin:form.deepMin!==""?+form.deepMin:null,
+      remMin:form.remMin!==""?+form.remMin:null,awakeMin:form.awakeMin!==""?+form.awakeMin:null,
+      efficiency:form.efficiency!==""?+form.efficiency:null,
+      screenTotalMin:ex?.screenTotalMin??null,screenApps:ex?.screenApps??null});
+    setSaved(true);setTimeout(()=>setSaved(false),1800);
+  };
+
+  const handleImport = useCallback(async e=>{
+    const f=e.target.files?.[0];if(!f)return;
+    setImpSt("parsing");
+    try{
+      const parsed=parseJSON(await f.text());
+      const dates=Object.keys(parsed);if(!dates.length){setImpSt("empty");return;}
+      let m=[...records],nc=0;
+      for(const [date,d] of Object.entries(parsed)){
+        const bD=timeToH(d.bedTime),sD=timeToH(d.sleepTime),wD=timeToH(d.wakeTime);
+        const nr={id:Date.now()+Math.random(),date,bedTime:d.bedTime,sleepTime:d.sleepTime,wakeTime:d.wakeTime,
+          duration:gap(sD,wD),inBedDuration:d.inBedMin?d.inBedMin/60:gap(bD,wD),soa:gap(bD,sD),
+          coreMin:d.coreMin,deepMin:d.deepMin,remMin:d.remMin,awakeMin:d.awakeMin,
+          efficiency:d.efficiency,source:"shortcut",
+          screenTotalMin:d.screenTotalMin,screenApps:d.apps||[],
+          quality:d.efficiency?Math.min(5,Math.max(1,Math.round(d.efficiency/20))):null};
+        const i=m.findIndex(r=>r.date===date);
+        if(i>=0){m[i]={...nr,id:m[i].id,quality:m[i].quality??nr.quality};}else{m.push(nr);nc++;}
+      }
+      persist(m.sort((a,b)=>a.date.localeCompare(b.date)));
+      setImpSt({total:dates.length,nc});
+    }catch(err){console.error(err);setImpSt("error");}
+    e.target.value="";
+  },[records]);
+
+  const avg=(fn)=>{const v=records.map(fn).filter(x=>x!=null&&!isNaN(x));return v.length?v.reduce((a,b)=>a+b,0)/v.length:null;};
+  const avgF=(fn,u)=>{const v=avg(fn);return v!=null?v.toFixed(1)+(u||""):"--";};
+
+
+
+  const detailRec = records.find(r=>r.date===detailDate);
+
+  // safe inset for iPhone notch
+  const safeTop = "env(safe-area-inset-top, 0px)";
+  const safeBot = "env(safe-area-inset-bottom, 0px)";
+
+  return (
+    <div style={{minHeight:"100vh",background:"linear-gradient(160deg,#060d1f 0%,#0d1b38 60%,#07111e 100%)",
+      paddingTop:`calc(${safeTop})`,paddingBottom:`calc(${safeBot} + 60px)`}}>
+
+      {/* HEADER */}
+      <div style={{textAlign:"center",padding:"32px 20px 16px",background:"linear-gradient(to bottom,rgba(30,58,120,0.45),transparent)",
+        borderBottom:"1px solid rgba(99,179,237,0.1)",position:"relative"}}>
+        <div style={{fontSize:40,marginBottom:6}}>🌙</div>
+        <div style={{fontSize:24,fontWeight:400,letterSpacing:"0.08em",
+          background:"linear-gradient(135deg,#90cdf4,#63b3ed)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>
+          睡眠 · 屏幕 · 时间
+        </div>
+        <button onClick={()=>setShowSet(v=>!v)}
+          style={{position:"absolute",right:16,top:32,background:"none",border:"none",fontSize:20,cursor:"pointer",color:"#718096"}}>⚙️</button>
+      </div>
+
+      {/* SETTINGS PANEL */}
+      {showSet&&(
+        <div className="fade-in" style={{background:"rgba(13,27,56,0.98)",border:"1px solid rgba(99,179,237,0.2)",
+          borderRadius:16,margin:"12px 16px",padding:"18px"}}>
+          <div style={{fontSize:14,color:"#90cdf4",marginBottom:14,fontWeight:600}}>⚙️ 设置</div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+            <span style={{fontSize:13,color:"#cbd5e0"}}>每日提醒</span>
+            <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer"}}>
+              <input type="checkbox" checked={settings.reminderOn}
+                onChange={e=>{
+                  const s={...settings,reminderOn:e.target.checked};
+                  saveSettings(s);
+                  if(e.target.checked) scheduleNotification(s.reminderTime);
+                }} style={{width:18,height:18,accentColor:"#3182ce"}}/>
+              <span style={{fontSize:13,color:"#718096"}}>开启</span>
+            </label>
+          </div>
+          {settings.reminderOn&&(
+            <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{fontSize:13,color:"#718096"}}>提醒时间</span>
+              <input type="time" value={settings.reminderTime}
+                onChange={e=>{const s={...settings,reminderTime:e.target.value};saveSettings(s);scheduleNotification(e.target.value);}}
+                style={{...S.input,flex:1,fontSize:15}}/>
+            </div>
+          )}
+          <div style={{fontSize:11,color:"#4a5568",marginTop:10,lineHeight:1.6}}>
+            💡 iOS 需先将网页「添加到主屏幕」才能收到通知
+          </div>
+        </div>
+      )}
+
+      {/* NAV */}
+      <div style={{display:"flex",justifyContent:"center",gap:8,padding:"16px 16px 0",flexWrap:"wrap"}}>
+        {[["log","✏️ 记录"],["chart","📈 图表"],["table","📋 明细"]].map(([id,lbl])=>(
+          <button key={id} style={S.navBtn(view===id)} onClick={()=>setView(id)}>{lbl}</button>
+        ))}
+      </div>
+
+      {/* STATS */}
+      {records.length>0&&(
+        <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8,margin:"14px auto",maxWidth:680,padding:"0 12px"}}>
+          {[
+            [avgF(r=>r.duration,"h"),                                    "睡眠","#63b3ed"],
+            [avgF(r=>r.soa?r.soa*60:null,"m"),                           "延迟","#f6ad55"],
+            [avgF(r=>r.efficiency,"%"),                                   "效率","#9f7aea"],
+            [avgF(r=>r.screenTotalMin!=null?r.screenTotalMin/60:null,"h"),"屏幕","#fc8174"],
+            [avgF(r=>disposable(r),"h"),                                  "可支配","#68d391"],
+          ].map(([val,lbl,clr])=>(
+            <div key={lbl} style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(99,179,237,0.1)",
+              borderRadius:12,padding:"12px 6px",textAlign:"center"}}>
+              <div style={{fontSize:17,fontWeight:700,color:clr,marginBottom:2}}>{val}</div>
+              <div style={{fontSize:10,color:"#718096",letterSpacing:"0.06em"}}>{lbl}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* ── LOG ── */}
+      {view==="log"&&(
+        <div style={{...S.card,maxWidth:520}} className="fade-in">
+          <div style={{fontSize:15,color:"#90cdf4",marginBottom:20}}>{editId?"✏️ 编辑记录":"📝 新建记录"}</div>
+
+          <F label="日期">
+            <input style={S.input} type="date" value={form.date} onChange={e=>setForm({...form,date:e.target.value})}/>
+          </F>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:16}}>
+            <div>
+              <Lbl>🛏 上床时间</Lbl>
+              <input style={S.input} type="time" value={form.bedTime} onChange={e=>setForm({...form,bedTime:e.target.value})}/>
+              <Tip>躺下（含玩手机）</Tip>
+            </div>
+            <div>
+              <Lbl>😴 入睡时间</Lbl>
+              <input style={S.input} type="time" value={form.sleepTime} onChange={e=>setForm({...form,sleepTime:e.target.value})}/>
+              <Tip>捷径导入自动填</Tip>
+            </div>
+          </div>
+          <F label="⏰ 起床时间">
+            <input style={S.input} type="time" value={form.wakeTime} onChange={e=>setForm({...form,wakeTime:e.target.value})}/>
+          </F>
+
+          {form.bedTime&&form.sleepTime&&form.wakeTime&&(
+            <div style={{display:"flex",flexWrap:"wrap",gap:12,justifyContent:"center",
+              fontSize:12,color:"#718096",padding:"10px 0",margin:"0 0 16px",
+              borderTop:"1px solid rgba(99,179,237,0.08)",borderBottom:"1px solid rgba(99,179,237,0.08)"}}>
+              <span>🕐 入睡延迟 <b style={{color:"#f6ad55"}}>{hToHM(gap(timeToH(form.bedTime),timeToH(form.sleepTime)))}</b></span>
+              <span>💤 睡眠 <b style={{color:"#63b3ed"}}>{hToHM(gap(timeToH(form.sleepTime),timeToH(form.wakeTime)))}</b></span>
+              <span>🛏 在床 <b style={{color:"#9f7aea"}}>{hToHM(gap(timeToH(form.bedTime),timeToH(form.wakeTime)))}</b></span>
+            </div>
+          )}
+
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",fontSize:12,color:"#90cdf4",marginBottom:10,borderBottom:"1px solid rgba(99,179,237,0.1)",paddingBottom:6}}>
+            <span>睡眠阶段（分钟）</span>
+            <span style={{fontSize:11,color:"#4a5568"}}>捷径导入自动填</span>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:8,marginBottom:16}}>
+            {[["核心","coreMin","#63b3ed"],["深度","deepMin","#9f7aea"],["REM","remMin","#f6ad55"],["清醒","awakeMin","#fc8174"]].map(([l,k,c])=>(
+              <div key={k}>
+                <Lbl color={c}>{l}</Lbl>
+                <input style={S.input} type="number" min={0} max={600} placeholder="min" value={form[k]} onChange={e=>setForm({...form,[k]:e.target.value})}/>
+              </div>
+            ))}
+          </div>
+          <F label="📊 睡眠效率 (%)">
+            <input style={S.input} type="number" min={0} max={100} placeholder="捷径自动计算" value={form.efficiency} onChange={e=>setForm({...form,efficiency:e.target.value})}/>
+          </F>
+          <F label="⭐ 睡眠质量">
+            <div style={{display:"flex",gap:8}}>
+              {[1,2,3,4,5].map(q=>(
+                <button key={q} style={{flex:1,padding:"10px 4px",borderRadius:10,border:"none",cursor:"pointer",fontSize:18,textAlign:"center",
+                  background:form.quality===q?"rgba(49,130,206,0.4)":"rgba(255,255,255,0.05)",
+                  outline:form.quality===q?"1px solid rgba(99,179,237,0.6)":"1px solid rgba(99,179,237,0.1)"}}
+                  onClick={()=>setForm({...form,quality:q})}>
+                  <div>{QE[q]}</div>
+                  <div style={{fontSize:9,marginTop:2,color:"#90cdf4"}}>{QL[q]}</div>
+                </button>
+              ))}
+            </div>
+          </F>
+
+          <button style={{...S.btn,background:saved?"linear-gradient(135deg,#2f855a,#38a169)":"linear-gradient(135deg,#2b6cb0,#3182ce)"}} onClick={handleSave}>
+            {saved?"✓ 已保存":editId?"更新记录":"保存记录"}
+          </button>
+          {editId&&<button style={{...S.btn,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(99,179,237,0.2)",marginTop:8}} onClick={()=>{setEditId(null);setForm(emptyForm());}}>取消</button>}
+
+          {/* Import */}
+          <div style={{marginTop:16,padding:"14px",background:"rgba(0,0,0,0.25)",borderRadius:12,border:"1px solid rgba(104,211,145,0.15)"}}>
+            <button style={{background:"none",border:"none",color:"#68d391",cursor:"pointer",fontSize:13,fontFamily:"inherit",fontWeight:600,width:"100%",textAlign:"left"}}
+              onClick={()=>setShowImp(v=>!v)}>⚡ 从 iPhone 捷径导入数据 {showImp?"▲":"▼"}</button>
+            {showImp&&(
+              <div style={{marginTop:12}} className="fade-in">
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                  <label style={{display:"inline-block",padding:"10px 18px",borderRadius:10,cursor:"pointer",
+                    background:"rgba(49,130,206,0.2)",border:"1px solid rgba(104,211,145,0.4)",color:"#68d391",fontSize:13}}
+                    onClick={()=>fileRef.current?.click()}>
+                    <input ref={fileRef} type="file" accept=".json" style={{display:"none"}} onChange={handleImport}/>
+                    {impSt==="parsing"?"⏳ 解析中...":"📂 选择 JSON 文件"}
+                  </label>
+                  {typeof impSt==="object"&&<span style={{fontSize:12,color:"#68d391"}}>✅ {impSt.total}天，新增{impSt.nc}</span>}
+                  {impSt==="empty"&&<span style={{fontSize:12,color:"#f6ad55"}}>⚠️ 未找到数据</span>}
+                  {impSt==="error"&&<span style={{fontSize:12,color:"#fc8174"}}>❌ 格式错误</span>}
+                </div>
+                <button style={{background:"none",border:"none",color:"#63b3ed",cursor:"pointer",fontSize:12,fontFamily:"inherit",textDecoration:"underline",display:"block",marginBottom:6}} onClick={()=>setShowGuide(v=>!v)}>{showGuide?"▲ 收起":"▼ 捷径搭建步骤"}</button>
+                {showGuide&&(
+                  <div style={{fontSize:12,color:"#718096",lineHeight:1.9,background:"rgba(0,0,0,0.2)",borderRadius:8,padding:"12px",marginBottom:8}}>
+                    <b style={{color:"#90cdf4"}}>一个捷径同时读取睡眠 + 屏幕时间：</b><br/>
+                    1. 捷径 App → 新建 → 命名「睡眠屏幕日报」<br/>
+                    2. 添加「<b>查找健康样本</b>」→ 类型「睡眠分析」→ 过滤结束日期在昨天<br/>
+                    3. 遍历片段，按 value 分类累加分钟（core / deep / rem / inBed / awake）<br/>
+                    4. inBed 最早开始=上床，第一非inBed开始=入睡，最晚结束=起床<br/>
+                    5. 添加「<b>获取屏幕使用时间</b>」→「<b>获取详细信息</b>」→ 遍历每个 App<br/>
+                    6. 拼成下方 JSON 格式 →「<b>存储到文件</b>」<br/>
+                    7. 自动化 → 每天早上 8:00 运行<br/><br/>
+                    <b style={{color:"#68d391"}}>💡</b> 屏幕时间会自动合并你所有 iCloud 设备
+                  </div>
+                )}
+                <button style={{background:"none",border:"none",color:"#63b3ed",cursor:"pointer",fontSize:12,fontFamily:"inherit",textDecoration:"underline",display:"block"}} onClick={()=>setShowSchema(v=>!v)}>{showSchema?"▲ 收起":"▼ JSON 格式"}</button>
+                {showSchema&&(
+                  <pre style={{fontSize:10,color:"#68d391",background:"rgba(0,0,0,0.3)",borderRadius:8,padding:"10px",overflowX:"auto",lineHeight:1.8,marginTop:6}}>{`[{
+  "date": "2025-01-15",
+  "bedTime": "23:05", "sleepTime": "23:28", "wakeTime": "07:12",
+  "coreMin": 245, "deepMin": 82, "remMin": 94, "awakeMin": 18,
+  "inBedMin": 487, "efficiency": 86,
+  "screenTotalMinutes": 238,
+  "apps": [
+    {"name":"微信","minutes":85,"category":"社交"},
+    {"name":"Notion","minutes":38,"category":"效率"}
+  ]
+}]`}</pre>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── CHARTS ── */}
+      {view==="chart"&&(
+        <ChartView records={records}/>
+      )}
+
+      {/* ── TABLE ── */}
+      {view==="table"&&(
+        <div style={{overflowX:"auto",margin:"16px auto",maxWidth:1000,padding:"0 10px"}} className="fade-in">
+          {records.length===0?<Empty/>:(
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead><tr>
+                {["日期","上床","入睡","起床","睡眠","延迟","深度","REM","效率","屏幕","可支配","质量",""].map(h=>(
+                  <th key={h} style={{padding:"9px 8px",textAlign:"left",color:"#63b3ed",fontSize:10,
+                    letterSpacing:"0.08em",textTransform:"uppercase",borderBottom:"1px solid rgba(99,179,237,0.18)",whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr></thead>
+              <tbody>
+                {[...records].reverse().map(r=>{
+                  const disp=disposable(r);
+                  return(
+                    <tr key={r.id}
+                      onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.05)"}
+                      onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                      <td style={S.td}>{r.date}</td>
+                      <td style={S.td}>{r.bedTime||"--"}</td>
+                      <td style={S.td}>{r.sleepTime||"--"}</td>
+                      <td style={S.td}>{r.wakeTime||"--"}</td>
+                      <td style={{...S.td,color:"#63b3ed",fontWeight:600}}>{r.duration!=null?hToHM(r.duration):"--"}</td>
+                      <td style={{...S.td,color:r.soa>0.5?"#fc8174":"#68d391"}}>{r.soa!=null?Math.round(r.soa*60)+"m":"--"}</td>
+                      <td style={{...S.td,color:"#9f7aea"}}>{r.deepMin!=null?r.deepMin+"m":"--"}</td>
+                      <td style={{...S.td,color:"#f6ad55"}}>{r.remMin!=null?r.remMin+"m":"--"}</td>
+                      <td style={{...S.td,color:r.efficiency>=85?"#68d391":r.efficiency>=70?"#f6ad55":"#fc8174"}}>{r.efficiency!=null?r.efficiency+"%":"--"}</td>
+                      <td style={{...S.td,color:r.screenTotalMin>=480?"#fc8174":r.screenTotalMin>=300?"#f6ad55":"#e2e8f0"}}>
+                        {r.screenTotalMin!=null?(r.screenTotalMin/60).toFixed(1)+"h":"--"}
+                        {r.screenApps?.length>0&&(
+                          <button onClick={()=>setDetailDate(r.date)}
+                            style={{marginLeft:4,background:"rgba(99,179,237,0.15)",border:"none",borderRadius:3,color:"#63b3ed",cursor:"pointer",fontSize:10,padding:"1px 5px"}}>详</button>
+                        )}
+                      </td>
+                      <td style={{...S.td,color:disp>=6?"#68d391":disp>=3?"#f6ad55":"#fc8174",fontWeight:600}}>{disp!=null?disp.toFixed(1)+"h":"--"}</td>
+                      <td style={S.td}>{r.quality?`${QE[r.quality]}`:"-"}</td>
+                      <td style={S.td}>
+                        <button onClick={()=>{
+                          setForm({date:r.date,bedTime:r.bedTime||"",sleepTime:r.sleepTime||"",wakeTime:r.wakeTime||"",
+                            quality:r.quality||4,coreMin:r.coreMin??"",deepMin:r.deepMin??"",remMin:r.remMin??"",awakeMin:r.awakeMin??"",efficiency:r.efficiency??""});
+                          setEditId(r.id);setView("log");
+                        }} style={{background:"none",border:"1px solid rgba(99,179,237,0.3)",color:"#63b3ed",padding:"3px 8px",borderRadius:5,cursor:"pointer",marginRight:3,fontSize:10}}>编辑</button>
+                        <button onClick={()=>persist(records.filter(x=>x.id!==r.id))}
+                          style={{background:"none",border:"1px solid rgba(252,129,116,0.3)",color:"#fc8174",padding:"3px 8px",borderRadius:5,cursor:"pointer",fontSize:10}}>删</button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* ── Detail Modal ── */}
+      {detailDate&&detailRec&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.8)",backdropFilter:"blur(5px)",
+          display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:16}}
+          onClick={()=>setDetailDate(null)}>
+          <div style={{background:"#0a1428",border:"1px solid rgba(99,179,237,0.2)",borderRadius:18,
+            padding:"20px",width:"100%",maxWidth:500,maxHeight:"85vh",overflowY:"auto"}}
+            onClick={e=>e.stopPropagation()}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:14}}>
+              <div>
+                <div style={{fontSize:15,color:"#90cdf4",fontWeight:600}}>{detailDate} 屏幕详情</div>
+                <div style={{fontSize:12,color:"#718096",marginTop:3,display:"flex",gap:12,flexWrap:"wrap"}}>
+                  <span>📱 {detailRec.screenTotalMin!=null?(detailRec.screenTotalMin/60).toFixed(1)+"h":"--"}</span>
+                  {disposable(detailRec)!=null&&<span style={{color:"#68d391"}}>✅ 可支配 {disposable(detailRec).toFixed(1)}h</span>}
+                </div>
+              </div>
+              <button onClick={()=>setDetailDate(null)} style={{background:"none",border:"none",color:"#718096",fontSize:20,cursor:"pointer"}}>✕</button>
+            </div>
+            <div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"flex-start"}}>
+              {detailRec.screenApps?.length>0&&(
+                <PieChart width={150} height={150}>
+                  <Pie data={detailRec.screenApps.slice(0,8)} dataKey="minutes" nameKey="name" cx={75} cy={75} innerRadius={40} outerRadius={68}>
+                    {detailRec.screenApps.slice(0,8).map((_,i)=><Cell key={i} fill={APP_CLR[i%APP_CLR.length]}/>)}
+                  </Pie>
+                  <RTooltip formatter={v=>[`${v}m`,""]} contentStyle={{background:"rgba(5,12,30,0.97)",border:"1px solid rgba(99,179,237,0.15)",borderRadius:8,fontSize:11}}/>
+                </PieChart>
+              )}
+              <div style={{flex:1,minWidth:160}}>
+                {(detailRec.screenApps||[]).map((app,i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 0",borderBottom:"1px solid rgba(255,255,255,0.04)"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:6}}>
+                      <div style={{width:7,height:7,borderRadius:"50%",background:APP_CLR[i%APP_CLR.length],flexShrink:0}}/>
+                      <span style={{fontSize:12}}>{app.name}</span>
+                      {app.category&&<span style={{fontSize:9,background:CAT_CLR[app.category]||"#4a5568",color:"#fff",padding:"1px 5px",borderRadius:8,opacity:0.85}}>{app.category}</span>}
+                    </div>
+                    <span style={{color:"#90cdf4",fontSize:12,fontWeight:600,marginLeft:8}}>
+                      {app.minutes>=60?`${(app.minutes/60).toFixed(1)}h`:`${app.minutes}m`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {detailRec.inBedDuration!=null&&detailRec.screenTotalMin!=null&&(
+              <DayBar r={detailRec}/>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── ChartView ────────────────────────────────────────────────────────────
+const RANGES = [
+  { label:"7天",  days:7  },
+  { label:"30天", days:30 },
+  { label:"90天", days:90 },
+  { label:"全部", days:0  },
+];
+
+// Convert "23:30" → 23.5, "00:20" → 24.33 (so midnight-crossing times stay > bedtime)
+function timeToChartH(t) {
+  if (!t) return null;
+  const [h, m] = t.split(":").map(Number);
+  const v = h + m / 60;
+  // Bedtime after midnight should be shown as 24+h so it sits above 20-something bedtime
+  return (h < 14) ? v + 24 : v;
+}
+// Format decimal hour back to HH:MM for axis/tooltip
+function hToClockStr(v) {
+  if (v == null) return "--";
+  const h = Math.floor(v) % 24;
+  const m = Math.round((v - Math.floor(v)) * 60);
+  return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}`;
+}
+
+// Tick formatter for time-of-day Y axis
+const clockTick = v => hToClockStr(v);
+
+// Tooltip that knows about time axes
+function ChartTip({active, payload, label, timeKeys=[]}) {
+  if (!active || !payload?.length) return null;
+  const unitOf = n => {
+    if (timeKeys.includes(n)) return ""; // formatted separately
+    if (["睡眠时长","屏幕时间","可支配时间","深度睡眠","核心睡眠","快速眼动","在床时长"].includes(n)) return "h";
+    if (n === "效率") return "%";
+    if (n === "入睡延迟") return "m";
+    return "";
+  };
+  return (
+    <div style={{background:"rgba(5,12,30,0.97)",border:"1px solid rgba(99,179,237,0.2)",
+      borderRadius:10,padding:"9px 14px",fontSize:12,minWidth:140}}>
+      <div style={{color:"#63b3ed",fontWeight:700,marginBottom:5}}>{label}</div>
+      {payload.map((p,i) => {
+        const isTime = timeKeys.includes(p.name);
+        const display = isTime ? hToClockStr(p.value) : (typeof p.value==="number" ? p.value.toFixed(1) : p.value);
+        return (
+          <div key={i} style={{color:p.color||p.fill||"#e2e8f0",marginBottom:2}}>
+            {p.name}: <b>{display}{unitOf(p.name)}</b>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ChartView({ records }) {
+  const [range, setRange] = useState(30);
+
+  const filtered = useMemo(() => {
+    if (!range) return records;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - range);
+    const cutStr = cutoff.toISOString().slice(0,10);
+    return records.filter(r => r.date >= cutStr);
+  }, [records, range]);
+
+  // X-axis tick density — thin out if many points
+  const tickEvery = filtered.length > 60 ? 7 : filtered.length > 30 ? 3 : 1;
+  const xTick = (val, idx) => idx % tickEvery === 0 ? val : "";
+
+  const data = useMemo(() => filtered.map(r => ({
+    date:      fmtDate(r.date),
+    上床时间:  timeToChartH(r.bedTime),
+    入睡时间:  timeToChartH(r.sleepTime),
+    起床时间:  r.wakeTime ? timeToH(r.wakeTime) : null,
+    睡眠时长:  r.duration        != null ? +r.duration.toFixed(2)         : null,
+    屏幕时间:  r.screenTotalMin  != null ? +(r.screenTotalMin/60).toFixed(2): null,
+    可支配时间:disposable(r)     != null ? +disposable(r).toFixed(2)       : null,
+    深度睡眠:  r.deepMin         != null ? +(r.deepMin/60).toFixed(2)      : null,
+    核心睡眠:  r.coreMin         != null ? +(r.coreMin/60).toFixed(2)      : null,
+    快速眼动:  r.remMin          != null ? +(r.remMin/60).toFixed(2)       : null,
+    入睡延迟:  r.soa             != null ? +(r.soa*60).toFixed(0)          : null,
+    效率:      r.efficiency,
+  })), [filtered]);
+
+  const showDots = filtered.length <= 60;
+  const hasSleep  = data.some(d => d.睡眠时长  != null);
+  const hasScreen = data.some(d => d.屏幕时间  != null);
+  const hasBed    = data.some(d => d.上床时间  != null);
+  const hasStages = data.some(d => d.深度睡眠  != null || d.核心睡眠 != null);
+  const hasOnset  = data.some(d => d.入睡延迟  != null);
+
+  const xProps = {
+    dataKey:"date", tick:{fill:"#718096",fontSize:10}, axisLine:false, tickLine:false,
+    tickFormatter: xTick,
+  };
+  const yProps = { axisLine:false, tickLine:false, tick:{fill:"#718096",fontSize:10} };
+  const grid = <CartesianGrid strokeDasharray="3 3" stroke="rgba(99,179,237,0.07)"/>;
+  const legStyle = {fontSize:11,color:"#90cdf4",paddingTop:6};
+
+  if (!data.length) return <Empty/>;
+
+  return (
+    <div style={{maxWidth:700,margin:"0 auto",padding:"0 10px"}} className="fade-in">
+
+      {/* Range selector */}
+      <div style={{display:"flex",gap:6,justifyContent:"center",padding:"14px 0 6px",flexWrap:"wrap"}}>
+        {RANGES.map(r => (
+          <button key={r.label}
+            onClick={() => setRange(r.days)}
+            style={{padding:"6px 16px",borderRadius:20,border:"none",cursor:"pointer",
+              fontSize:12,fontFamily:"inherit",transition:"all 0.2s",
+              background: range===r.days ? "linear-gradient(135deg,#2b6cb0,#3182ce)" : "rgba(255,255,255,0.06)",
+              color: range===r.days ? "#fff" : "#90cdf4",
+              outline: range===r.days ? "none" : "1px solid rgba(99,179,237,0.2)",
+              boxShadow: range===r.days ? "0 0 12px rgba(49,130,206,0.3)" : "none"}}>
+            {r.label}
+          </button>
+        ))}
+        <span style={{fontSize:11,color:"#4a5568",alignSelf:"center",marginLeft:4}}>
+          共 {filtered.length} 天记录
+        </span>
+      </div>
+
+      {/* ① 上床 / 入睡 / 起床时间折线图 */}
+      {hasBed && (
+        <CC title="🕐 上床 · 入睡 · 起床时间">
+          <ResponsiveContainer width="100%" height={210}>
+            <LineChart data={data} margin={{left:10,right:6}}>
+              {grid}
+              <XAxis {...xProps}/>
+              <YAxis {...yProps}
+                domain={["auto","auto"]}
+                tickFormatter={clockTick}
+                width={38}/>
+              <RTooltip content={<ChartTip timeKeys={["上床时间","入睡时间","起床时间"]}/>}/>
+              <Legend wrapperStyle={legStyle}/>
+              <Line type="monotone" dataKey="上床时间"  stroke="#9f7aea" strokeWidth={2}
+                dot={showDots?{fill:"#9f7aea",r:2.5}:false} connectNulls/>
+              <Line type="monotone" dataKey="入睡时间"  stroke="#63b3ed" strokeWidth={2}
+                dot={showDots?{fill:"#63b3ed",r:2.5}:false} connectNulls/>
+              <Line type="monotone" dataKey="起床时间"  stroke="#68d391" strokeWidth={2}
+                dot={showDots?{fill:"#68d391",r:2.5}:false} connectNulls strokeDasharray="4 2"/>
+            </LineChart>
+          </ResponsiveContainer>
+          <div style={{fontSize:10,color:"#4a5568",textAlign:"center",paddingBottom:4}}>
+            纵轴为时刻（上床 / 入睡时间跨午夜显示为 24:xx–25:xx）
+          </div>
+        </CC>
+      )}
+
+      {/* ② 睡眠时长柱形图 */}
+      {hasSleep && (
+        <CC title="💤 每日睡眠时长（小时）">
+          <ResponsiveContainer width="100%" height={200}>
+            <ComposedChart data={data} margin={{left:-14,right:6}}>
+              <defs>
+                <linearGradient id="slG" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#3182ce" stopOpacity={0.5}/>
+                  <stop offset="95%" stopColor="#3182ce" stopOpacity={0.05}/>
+                </linearGradient>
+              </defs>
+              {grid}
+              <XAxis {...xProps}/>
+              <YAxis {...yProps} unit="h" domain={[0,"auto"]}/>
+              <RTooltip content={<ChartTip/>}/>
+              <Legend wrapperStyle={legStyle}/>
+              {/* Reference line at 8h */}
+              <Bar dataKey="睡眠时长" fill="#3182ce" fillOpacity={0.7} radius={[3,3,0,0]}/>
+              <Line type="monotone" dataKey="睡眠时长" stroke="#90cdf4" strokeWidth={1.5}
+                dot={false} connectNulls/>
+            </ComposedChart>
+          </ResponsiveContainer>
+        </CC>
+      )}
+
+      {/* ③ 屏幕使用时间柱形图 */}
+      {hasScreen && (
+        <CC title="📱 每日屏幕使用时间（小时）">
+          <ResponsiveContainer width="100%" height={200}>
+            <ComposedChart data={data} margin={{left:-14,right:6}}>
+              {grid}
+              <XAxis {...xProps}/>
+              <YAxis {...yProps} unit="h" domain={[0,"auto"]}/>
+              <RTooltip content={<ChartTip/>}/>
+              <Legend wrapperStyle={legStyle}/>
+              <Bar dataKey="屏幕时间" fill="#fc8174" fillOpacity={0.75} radius={[3,3,0,0]}/>
+              <Line type="monotone" dataKey="屏幕时间" stroke="#fca89a" strokeWidth={1.5}
+                dot={false} connectNulls/>
+            </ComposedChart>
+          </ResponsiveContainer>
+        </CC>
+      )}
+
+      {/* ④ 睡眠 vs 屏幕 对比 */}
+      {hasSleep && hasScreen && (
+        <CC title="⚖️ 睡眠时长 vs 屏幕时间对比">
+          <ResponsiveContainer width="100%" height={210}>
+            <BarChart data={data} margin={{left:-14,right:6}}>
+              {grid}
+              <XAxis {...xProps}/>
+              <YAxis {...yProps} unit="h"/>
+              <RTooltip content={<ChartTip/>}/>
+              <Legend wrapperStyle={legStyle}/>
+              <Bar dataKey="睡眠时长" fill="rgba(49,130,206,0.7)"  radius={[3,3,0,0]}/>
+              <Bar dataKey="屏幕时间" fill="rgba(252,129,116,0.7)" radius={[3,3,0,0]}/>
+            </BarChart>
+          </ResponsiveContainer>
+        </CC>
+      )}
+
+      {/* ⑤ 时间分配堆叠 */}
+      {hasSleep && hasScreen && (
+        <CC title="🕐 24h 时间分配（在床 + 屏幕 + 可支配）">
+          <ResponsiveContainer width="100%" height={210}>
+            <BarChart data={data} margin={{left:-14,right:6}}>
+              {grid}
+              <XAxis {...xProps}/>
+              <YAxis {...yProps} unit="h" domain={[0,24]}/>
+              <RTooltip content={<ChartTip/>}/>
+              <Legend wrapperStyle={legStyle}/>
+              <Bar dataKey="在床时长"   stackId="a" fill="rgba(74,85,104,0.85)"/>
+              <Bar dataKey="屏幕时间"   stackId="a" fill="rgba(252,129,116,0.85)"/>
+              <Bar dataKey="可支配时间" stackId="a" fill="rgba(104,211,145,0.85)" radius={[3,3,0,0]}/>
+            </BarChart>
+          </ResponsiveContainer>
+          <div style={{fontSize:10,color:"#4a5568",textAlign:"center",paddingBottom:4}}>
+            灰=在床 · 红=屏幕 · 绿=可支配（其余为未统计的清醒时间）
+          </div>
+        </CC>
+      )}
+
+      {/* ⑥ 睡眠阶段堆叠 */}
+      {hasStages && (
+        <CC title="🧠 睡眠阶段分布（小时）">
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={data} margin={{left:-14,right:6}}>
+              {grid}
+              <XAxis {...xProps}/>
+              <YAxis {...yProps} unit="h"/>
+              <RTooltip content={<ChartTip/>}/>
+              <Legend wrapperStyle={legStyle}/>
+              <Bar dataKey="深度睡眠" stackId="a" fill="#9f7aea"/>
+              <Bar dataKey="快速眼动" stackId="a" fill="#f6ad55"/>
+              <Bar dataKey="核心睡眠" stackId="a" fill="#4299e1" radius={[3,3,0,0]}/>
+            </BarChart>
+          </ResponsiveContainer>
+        </CC>
+      )}
+
+      {/* ⑦ 入睡延迟折线 */}
+      {hasOnset && (
+        <CC title="⏱ 入睡延迟（分钟）">
+          <ResponsiveContainer width="100%" height={170}>
+            <LineChart data={data} margin={{left:-14,right:6}}>
+              {grid}
+              <XAxis {...xProps}/>
+              <YAxis {...yProps} unit="m"/>
+              <RTooltip content={<ChartTip/>}/>
+              <Line type="monotone" dataKey="入睡延迟" stroke="#fc8174" strokeWidth={2}
+                dot={showDots?{fill:"#fc8174",r:2.5}:false} connectNulls/>
+            </LineChart>
+          </ResponsiveContainer>
+        </CC>
+      )}
+    </div>
+  );
+}
+
+// ─── Tiny components ──────────────────────────────────────────────────────
+const F    = ({label,children}) => <div style={{marginBottom:16}}><Lbl>{label}</Lbl>{children}</div>;
+const Lbl  = ({children,color}) => <label style={{fontSize:10,color:color||"#90cdf4",letterSpacing:"0.15em",textTransform:"uppercase",marginBottom:6,display:"block"}}>{children}</label>;
+const Tip  = ({children})       => <div style={{fontSize:10,color:"#718096",marginTop:4,lineHeight:1.5}}>{children}</div>;
+const CC   = ({title,children}) => (
+  <div style={{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(99,179,237,0.1)",borderRadius:16,padding:"18px 10px 8px",marginBottom:12}}>
+    <div style={{fontSize:12,color:"#90cdf4",letterSpacing:"0.1em",marginBottom:12,paddingLeft:4}}>{title}</div>
+    {children}
+  </div>
+);
+const Empty = () => (
+  <div style={{textAlign:"center",color:"#4a5568",padding:"60px 20px"}}>
+    <span style={{fontSize:46,display:"block",marginBottom:12}}>🌙</span>
+    暂无数据
+  </div>
+);
+function DayBar({r}) {
+  const bed=r.inBedDuration??r.duration??0,scr=(r.screenTotalMin??0)/60,free=Math.max(0,24-bed-scr);
+  const segs=[{l:"在床",v:bed,c:"rgba(74,85,104,0.85)"},{l:"屏幕",v:scr,c:"rgba(252,129,116,0.85)"},{l:"可支配",v:free,c:"rgba(104,211,145,0.85)"}].filter(s=>s.v>0.05);
+  return(
+    <div style={{marginTop:16}}>
+      <div style={{fontSize:10,color:"#718096",marginBottom:6,letterSpacing:"0.08em"}}>24H 时间分配</div>
+      <div style={{display:"flex",borderRadius:6,overflow:"hidden",height:20}}>
+        {segs.map((s,i)=><div key={i} style={{flex:s.v,background:s.c}}/>)}
+      </div>
+      <div style={{display:"flex",gap:12,marginTop:6,flexWrap:"wrap"}}>
+        {segs.map((s,i)=>(
+          <div key={i} style={{display:"flex",alignItems:"center",gap:4,fontSize:11,color:"#718096"}}>
+            <div style={{width:7,height:7,borderRadius:2,background:s.c}}/>
+            {s.l} <b style={{color:"#90cdf4"}}>{s.v.toFixed(1)}h</b>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Shared styles ────────────────────────────────────────────────────────
+const S = {
+  input:{width:"100%",padding:"10px 12px",borderRadius:9,background:"rgba(255,255,255,0.07)",
+    border:"1px solid rgba(99,179,237,0.2)",color:"#e2e8f0",fontSize:14,fontFamily:"inherit",outline:"none",boxSizing:"border-box"},
+  card:{background:"rgba(255,255,255,0.04)",backdropFilter:"blur(12px)",border:"1px solid rgba(99,179,237,0.14)",
+    borderRadius:18,padding:"22px 20px",margin:"14px auto"},
+  navBtn:a=>({padding:"9px 20px",borderRadius:50,border:"none",cursor:"pointer",fontSize:12,
+    letterSpacing:"0.08em",fontFamily:"inherit",transition:"all 0.2s",
+    ...(a?{background:"linear-gradient(135deg,#2b6cb0,#3182ce)",color:"#fff",boxShadow:"0 0 16px rgba(49,130,206,0.35)"}
+          :{background:"rgba(255,255,255,0.05)",color:"#90cdf4",border:"1px solid rgba(99,179,237,0.2)"})}),
+  btn:{width:"100%",padding:"13px",borderRadius:11,border:"none",cursor:"pointer",
+    fontSize:13,letterSpacing:"0.12em",fontFamily:"inherit",color:"#fff",
+    boxShadow:"0 4px 18px rgba(49,130,206,0.25)",transition:"background 0.3s"},
+  td:{padding:"10px 8px",borderBottom:"1px solid rgba(255,255,255,0.04)",color:"#cbd5e0",whiteSpace:"nowrap"},
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
