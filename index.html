@@ -44,6 +44,21 @@ window.onerror = function(msg,src,line,col,err){
 </script>
 
 <script type="text/babel">
+// ─── Error Boundary ──────────────────────────────────────────────────────────
+class ErrorBoundary extends React.Component {
+  constructor(p) { super(p); this.state = { err: null }; }
+  static getDerivedStateFromError(e) { return { err: e }; }
+  render() {
+    if (this.state.err) {
+      return React.createElement('div', {
+        style:{padding:'32px',color:'#fc8174',fontFamily:'monospace',fontSize:13,
+          background:'#0d1b38',minHeight:'100vh',whiteSpace:'pre-wrap'}
+      }, '❌ 渲染错误，请截图发给开发者：\n\n' + (this.state.err.message||'') + '\n\n' + (this.state.err.stack||''));
+    }
+    return this.props.children;
+  }
+}
+
 const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const { AreaChart, Area, LineChart, Line, BarChart, Bar, ComposedChart,
         XAxis, YAxis, CartesianGrid, Tooltip: RTooltip, ResponsiveContainer,
@@ -367,16 +382,18 @@ function App() {
               onClick={()=>setShowImp(v=>!v)}>⚡ 从 iPhone 捷径导入数据 {showImp?"▲":"▼"}</button>
             {showImp&&(
               <div style={{marginTop:12}} className="fade-in">
-                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
-                  <label style={{display:"inline-block",padding:"10px 18px",borderRadius:10,cursor:"pointer",
-                    background:"rgba(49,130,206,0.2)",border:"1px solid rgba(104,211,145,0.4)",color:"#68d391",fontSize:13}}
-                    onClick={()=>fileRef.current?.click()}>
-                    <input ref={fileRef} type="file" accept=".json" style={{display:"none"}} onChange={handleImport}/>
+                <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12,flexWrap:"wrap"}}>
+                  <input ref={fileRef} type="file" accept=".json" style={{display:"none"}} onChange={handleImport}/>
+                  <button
+                    style={{padding:"10px 18px",borderRadius:10,cursor:"pointer",
+                      background:"rgba(49,130,206,0.2)",border:"1px solid rgba(104,211,145,0.4)",
+                      color:"#68d391",fontSize:13,fontFamily:"inherit"}}
+                    onClick={()=>{ setImpSt(null); fileRef.current && fileRef.current.click(); }}>
                     {impSt==="parsing"?"⏳ 解析中...":"📂 选择 JSON 文件"}
-                  </label>
+                  </button>
                   {typeof impSt==="object"&&<span style={{fontSize:12,color:"#68d391"}}>✅ {impSt.total}天，新增{impSt.nc}</span>}
                   {impSt==="empty"&&<span style={{fontSize:12,color:"#f6ad55"}}>⚠️ 未找到数据</span>}
-                  {impSt==="error"&&<span style={{fontSize:12,color:"#fc8174"}}>❌ 格式错误</span>}
+                  {impSt==="error"&&<span style={{fontSize:12,color:"#fc8174"}}>❌ 格式错误，请检查 JSON 格式</span>}
                 </div>
                 <button style={{background:"none",border:"none",color:"#63b3ed",cursor:"pointer",fontSize:12,fontFamily:"inherit",textDecoration:"underline",display:"block",marginBottom:6}} onClick={()=>setShowGuide(v=>!v)}>{showGuide?"▲ 收起":"▼ 捷径搭建步骤"}</button>
                 {showGuide&&(
@@ -844,7 +861,7 @@ const S = {
   td:{padding:"10px 8px",borderBottom:"1px solid rgba(255,255,255,0.04)",color:"#cbd5e0",whiteSpace:"nowrap"},
 };
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(ErrorBoundary, null, React.createElement(App, null)));
 </script>
 </body>
 </html>
