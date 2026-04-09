@@ -391,7 +391,7 @@ function App() {
                     onClick={()=>{ setImpSt(null); fileRef.current && fileRef.current.click(); }}>
                     {impSt==="parsing"?"⏳ 解析中...":"📂 选择 JSON 文件"}
                   </button>
-                  {typeof impSt==="object"&&<span style={{fontSize:12,color:"#68d391"}}>✅ {impSt.total}天，新增{impSt.nc}</span>}
+                  {impSt && typeof impSt==="object" && impSt.total!=null &&<span style={{fontSize:12,color:"#68d391"}}>✅ {impSt.total}天，新增{impSt.nc}</span>}
                   {impSt==="empty"&&<span style={{fontSize:12,color:"#f6ad55"}}>⚠️ 未找到数据</span>}
                   {impSt==="error"&&<span style={{fontSize:12,color:"#fc8174"}}>❌ 格式错误，请检查 JSON 格式</span>}
                 </div>
